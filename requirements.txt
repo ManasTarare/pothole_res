@@ -1,0 +1,13 @@
+streamlit
+ultralytics
+opencv-python-headless
+numpy
+pandas
+Pillow
+osmnx
+geopandas
+shapely
+folium
+streamlit-folium
+torch
+torchvision
