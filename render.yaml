@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: smart-road-intelligence
+    env: python
+    plan: standard          # upgrade to pro for GPU support
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300
+    healthCheckPath: /      # Flask root route returns 200 OK
+    autoDeploy: true
+    envVars:
+      - key: IS_CLOUD
+        value: "true"
+      - key: MODEL_PATH
+        value: yolov8n.pt   # override with your best.pt path if uploaded
+      - key: DATABASE_PATH
+        value: /tmp/pothole.db   # writable temp dir on Render
+      - key: ADMIN_USER
+        sync: false             # set securely in Render dashboard
+      - key: ADMIN_PASS
+        sync: false             # set securely in Render dashboard
+      - key: SECRET_KEY
+        generateValue: true
+      - key: TWILIO_SID
+        sync: false
+      - key: TWILIO_AUTH
+        sync: false
+      - key: TWILIO_PHONE
+        sync: false

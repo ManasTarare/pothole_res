@@ -1,13 +1,26 @@
-streamlit
-ultralytics
-opencv-python-headless
-numpy
-pandas
-Pillow
-osmnx
-geopandas
-shapely
-folium
-streamlit-folium
-torch
-torchvision
+# Web framework
+flask>=3.0.0
+gunicorn>=22.0.0
+
+# Computer vision
+ultralytics>=8.0.0
+opencv-python-headless>=4.8.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Data
+numpy>=1.24.0
+pandas>=2.0.0
+Pillow>=10.0.0
+
+# GIS
+osmnx>=1.9.0
+geopandas>=0.14.0
+shapely>=2.0.0
+geopy>=2.4.0
+
+# SMS (optional — leave credentials blank to simulate)
+twilio>=8.0.0
+
+# Config
+python-dotenv>=1.0.0

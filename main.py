@@ -1,662 +1,640 @@
-import streamlit as st
-from ultralytics import YOLO
+"""
+🛣️ Smart Road Intelligence System
+REST API entry point — Flask + Gunicorn, suitable for Render deployment.
+
+Endpoints:
+  GET  /health                     — liveness check
+  POST /api/analyze                — upload video + route coords, returns detections
+  GET  /api/records                — all pothole records (paginated)
+  GET  /api/stats                  — aggregate statistics
+  GET  /api/roads                  — unique road names
+  GET  /api/roads/<name>           — records for a specific road
+  POST /api/dispatch               — send SMS work-order to contractor (requires X-Admin-Key)
+  POST /api/admin/reset            — wipe all records (requires X-Admin-Key)
+  POST /api/admin/pricing          — update repair cost thresholds (requires X-Admin-Key)
+  GET  /api/video/<filename>       — stream processed video file
+  GET  /api/hazards                — potholes near a GPS coordinate
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import uuid
+import logging
+
 import cv2
 import numpy as np
-from PIL import Image
-import tempfile
-import pandas as pd
-import math
-import subprocess
-import shutil
-import os
 import torch
-import json
-import time
-from geopy.distance import geodesic 
+from flask import Flask, jsonify, request, send_file, send_from_directory, abort
+from geopy.distance import geodesic
+from shapely.geometry import LineString, Point
+import pandas as pd
 
-# GIS & Map Libraries
+# GIS
 import osmnx as ox
 import geopandas as gpd
-from shapely.geometry import LineString, box
-import folium
-from folium.plugins import HeatMap
-from streamlit_folium import st_folium
 
-# SMS Library
+# SMS (optional)
 try:
-    from twilio.rest import Client
+    from twilio.rest import Client as TwilioClient
+    TWILIO_AVAILABLE = True
 except ImportError:
-    pass 
+    TWILIO_AVAILABLE = False
 
-# =========================
-# 1. PAGE CONFIGURATION
-# =========================
-st.set_page_config(
-    page_title="Smart Road Intelligence", 
-    layout="wide", 
-    page_icon="🛣️",
-    initial_sidebar_state="expanded"
-)
+from config import Config
+from database import Database
 
-st.markdown("""
-<style>
-    div[data-testid="stMetric"] {
-        background-color: #1E1E1E;
-        border: 1px solid #333;
-        padding: 15px;
-        border-radius: 8px;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 24px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 50px;
-        white-space: pre-wrap;
-        background-color: #0E1117;
-        border-radius: 4px 4px 0px 0px;
-        padding-left: 20px;
-        padding-right: 20px;
-    }
-</style>
-""", unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 
-# =========================
-# 2. SYSTEM CONFIG
-# =========================
-ADMIN_USER = "admin"
-ADMIN_PASS = "RoadSafe2025!"
-DEFAULT_MODEL_PATH = r"E:\road\runs\detect\pothole_model_final\weights\best.pt" 
+# ---------------------------------------------------------------------------
+# App bootstrap
+# ---------------------------------------------------------------------------
+app = Flask(__name__, static_folder=".", static_url_path="")
+cfg = Config()
+app.config["MAX_CONTENT_LENGTH"] = cfg.MAX_CONTENT_LENGTH  # 500 MB upload limit
+db = Database(cfg.DATABASE_PATH)
 
-# Twilio Credentials (REPLACE WITH YOUR REAL KEYS)
-TWILIO_SID = "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" 
-TWILIO_AUTH = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-TWILIO_PHONE = "+15555555555"
-
-DIST_THRESHOLD = 50       
-FRAME_COOLDOWN = 20       
-BBOX_BUFFER_DEG = 0.005
-FRAME_SKIP = 3 
-CLOUD_DB_FILE = "pothole_db.json"
-
-# =========================
-# 3. UTILITIES
-# =========================
-def has_ffmpeg():
-    return shutil.which("ffmpeg") is not None
-
-def get_video_writer(output_path, fps, width, height):
-    if has_ffmpeg():
-        return cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height)), "mp4_intermediate"
-    else:
-        return cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'VP80'), fps, (width, height)), "webm"
-
-def convert_video_for_browser(input_path, output_path):
-    if has_ffmpeg():
+# One-time JSON migration
+if os.path.exists(cfg.LEGACY_JSON_PATH):
+    migrated = db.import_from_json(cfg.LEGACY_JSON_PATH)
+    if migrated:
         try:
-            command = ["ffmpeg", "-y", "-i", input_path, "-vcodec", "libx264", "-pix_fmt", "yuv420p", "-acodec", "aac", output_path]
-            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            return output_path, "video/mp4"
-        except: return input_path, "video/mp4"
-    return input_path, "video/webm"
+            os.rename(cfg.LEGACY_JSON_PATH, cfg.LEGACY_JSON_PATH + ".imported")
+            log.info(f"Migrated {migrated} records from legacy JSON.")
+        except OSError as e:
+            log.warning(f"Could not rename legacy JSON: {e}")
 
-def save_to_cloud_db(records, source_id):
-    """Saves records to the local JSON file (Simulated Cloud)."""
-    new_entries = []
-    for r in records:
-        new_entries.append({
-            "lat": r["Latitude"],
-            "lon": r["Longitude"],
-            "road_name": r.get("Road_Name", "Unknown Road"), 
-            "severity": r["Severity"],
-            "cost": r["Est_Cost"],
-            "source": source_id
-        })
-    
-    existing_data = []
-    if os.path.exists(CLOUD_DB_FILE):
-        try:
-            with open(CLOUD_DB_FILE, "r") as f:
-                existing_data = json.load(f)
-        except: pass
-    
-    existing_data.extend(new_entries)
-    
-    with open(CLOUD_DB_FILE, "w") as f:
-        json.dump(existing_data, f)
-    
-    return len(new_entries)
-
-def send_sms_alert(to_number, body):
-    try:
-        if "ACxxx" in TWILIO_SID: 
-            st.warning("⚠️ Twilio Credentials not set. SMS Simulated in Console.")
-            print(f"--- SMS TO {to_number} ---\n{body}\n-----------------------")
-            return True
-        client = Client(TWILIO_SID, TWILIO_AUTH)
-        client.messages.create(body=body, from_=TWILIO_PHONE, to=to_number)
-        return True
-    except Exception as e:
-        # Hide full error from UI, but print to console for debugging
-        print(f"Twilio Error Log: {e}") 
-        st.error("❌ Failed to send SMS.")
-        return False
-
-# =========================
-# 4. SESSION STATE INIT
-# =========================
-keys = {
-    "video_id": None, "video_processed": False, "records": [], 
-    "output_video_path": None, "output_mime": None, 
-    "road_geom": None, "road_names": [], 
-    "snapshots": [], "admin_logged_in": False,
-    "scan_trigger": False, 
-    "cost_minor": 50, "cost_mod": 150, "cost_sev": 400, "global_conf": 0.25,
-    "uploader_key": 0,
-    # Map Coordinates Defaults
-    "start_lat": 19.0760, "start_lon": 72.8777,
-    "end_lat": 19.0800, "end_lon": 72.8800,
-    "map_selection_mode": "🟢 Set Start Point" # Default mode
+# In-memory pricing (overridable via /api/admin/pricing)
+_pricing = {
+    "Minor":    cfg.COST_MINOR,
+    "Moderate": cfg.COST_MODERATE,
+    "Severe":   cfg.COST_SEVERE,
 }
 
-for k, v in keys.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+# Allowed video MIME types / extensions
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
-# =========================
-# 5. MODEL LOADER
-# =========================
-@st.cache_resource
-def load_model(path):
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def _safe_filename(name: str) -> str:
+    """Strip path separators and unsafe chars from a filename, then add a UUID prefix."""
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(name))
+    return f"{uuid.uuid4().hex}_{base}"
+
+
+def has_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def get_video_writer(output_path: str, fps: float, width: int, height: int):
+    if has_ffmpeg():
+        return (
+            cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)),
+            "mp4_intermediate",
+        )
+    webm_path = output_path.replace(".mp4", ".webm")
+    return (
+        cv2.VideoWriter(webm_path, cv2.VideoWriter_fourcc(*"VP80"), fps, (width, height)),
+        "webm",
+    )
+
+
+def convert_video_for_browser(input_path: str, output_path: str):
+    if has_ffmpeg():
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", input_path,
+                 "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+                 "-acodec", "aac", output_path],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            return output_path, "video/mp4"
+        except subprocess.CalledProcessError as e:
+            log.warning(f"FFmpeg conversion failed: {e.stderr.decode(errors='ignore')}")
+    if input_path.endswith(".webm"):
+        return input_path, "video/webm"
+    return input_path, "video/mp4"
+
+
+def send_sms_alert(to_number: str, body: str) -> bool:
+    if not TWILIO_AVAILABLE:
+        log.info(f"[SMS SIM — Twilio not installed] TO {to_number}:\n{body}")
+        return True
+    if not cfg.TWILIO_SID or cfg.TWILIO_SID.startswith("AC_YOUR"):
+        log.info(f"[SMS SIM — credentials not set] TO {to_number}:\n{body}")
+        return True
     try:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = YOLO(path)
-        model.to(device)
-        return model, device
+        client = TwilioClient(cfg.TWILIO_SID, cfg.TWILIO_AUTH)
+        client.messages.create(body=body, from_=cfg.TWILIO_PHONE, to=to_number)
+        return True
     except Exception as e:
-        st.error(f"Error loading model: {e}")
-        return None, None
+        log.error(f"[Twilio Error] {e}")
+        return False
 
-# =========================
-# 6. GIS ENGINE
-# =========================
-@st.cache_data
+
+# ---------------------------------------------------------------------------
+# Model loader (cached at process level)
+# ---------------------------------------------------------------------------
+_model_cache: dict = {}
+
+
+def load_model(path: str):
+    """Load and cache a YOLO model. Returns (model, device) or (None, None) on failure."""
+    if path not in _model_cache:
+        try:
+            from ultralytics import YOLO
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = YOLO(path)
+            model.to(device)
+            _model_cache[path] = (model, device)
+            log.info(f"Model loaded from '{path}' on {device}.")
+        except Exception as e:
+            log.error(f"[Model Load Error] {e}")
+            _model_cache[path] = (None, None)
+    return _model_cache[path]
+
+
+# ---------------------------------------------------------------------------
+# GIS engine
+# ---------------------------------------------------------------------------
+
 def fetch_gis_data(start_lat, start_lon, end_lat, end_lon):
     try:
         G = ox.graph_from_point((start_lat, start_lon), dist=3000, network_type="drive")
         start_node = ox.nearest_nodes(G, start_lon, start_lat)
-        end_node = ox.nearest_nodes(G, end_lon, end_lat)
-        try: route = ox.shortest_path(G, start_node, end_node)
-        except: return None, None
-        if not route: return None, None
+        end_node   = ox.nearest_nodes(G, end_lon,   end_lat)
+        try:
+            route = ox.shortest_path(G, start_node, end_node)
+        except Exception:
+            return None, None
+        if not route:
+            return None, None
 
         edges = ox.graph_to_gdfs(G, nodes=False)
         geoms, names = [], []
-        
+
         for u, v in zip(route[:-1], route[1:]):
             try:
-                edge = edges.loc[(u, v, 0)] if (u, v, 0) in edges.index else edges.loc[(u, v)]
+                edge = (
+                    edges.loc[(u, v, 0)]
+                    if (u, v, 0) in edges.index
+                    else edges.loc[(u, v)]
+                )
                 if isinstance(edge, pd.DataFrame):
                     geom = edge.iloc[0].geometry
-                    name = edge.iloc[0].get('name', 'Unknown Road')
+                    name = edge.iloc[0].get("name", "Unknown Road")
                 else:
                     geom = edge.geometry
-                    name = edge.get('name', 'Unknown Road')
-                
-                if isinstance(name, list): name = name[0]
+                    name = edge.get("name", "Unknown Road")
+                if isinstance(name, list):
+                    name = name[0]
                 geoms.append(geom)
-                names.append(name)
-            except: continue
-            
-        if not geoms: return None, None
-        
-        road_geom = LineString([pt for g in geoms for pt in g.coords])
-        road_network_data = list(zip(geoms, names))
-        return road_geom, road_network_data
-    except Exception: return None, None
+                names.append(str(name) if name else "Unknown Road")
+            except Exception:
+                continue
 
-def get_road_name_at_point(point_geom, network_data):
-    if not network_data: return "Unknown Road"
-    best_name, min_dist = "Unknown Road", float('inf')
+        if not geoms:
+            return None, None
+
+        road_geom = LineString([pt for g in geoms for pt in g.coords])
+        return road_geom, list(zip(geoms, names))
+    except Exception as e:
+        log.warning(f"GIS fetch failed: {e}")
+        return None, None
+
+
+def get_road_name_at_point(point_geom: Point, network_data) -> str:
+    if not network_data:
+        return "Unknown Road"
+    best_name, min_dist = "Unknown Road", float("inf")
     for geom, name in network_data:
-        dist = geom.distance(point_geom)
-        if dist < min_dist:
-            min_dist = dist
-            best_name = str(name)
+        d = geom.distance(point_geom)
+        if d < min_dist:
+            min_dist, best_name = d, str(name)
     return best_name
 
-# =========================
-# 7. PAGE FUNCTIONS
-# =========================
 
-def sidebar_nav():
-    st.sidebar.title("🛣️ Navigation")
-    page = st.sidebar.radio("Go to", ["Dashboard", "Live Warnings", "Admin Panel"])
-    
-    st.sidebar.divider()
-    model_path_input = st.sidebar.text_input("Model Path", DEFAULT_MODEL_PATH, disabled=True) 
-    model, device_type = load_model(model_path_input)
-    
-    if device_type == 'cuda':
-        st.sidebar.success(f"GPU Active: {torch.cuda.get_device_name(0)}")
-    else:
-        st.sidebar.warning("Running on CPU")
-        
-    return page, model, device_type
+# ---------------------------------------------------------------------------
+# Admin auth helper
+# ---------------------------------------------------------------------------
 
-def admin_panel():
-    st.header("🔒 Admin Command Center")
-    if not st.session_state["admin_logged_in"]:
-        with st.form("login_form"):
-            st.subheader("Authentication Required")
-            user = st.text_input("Username")
-            passwd = st.text_input("Password", type="password")
-            if st.form_submit_button("Unlock System"):
-                if user == ADMIN_USER and passwd == ADMIN_PASS:
-                    st.session_state["admin_logged_in"] = True
-                    st.rerun()
-                else:
-                    st.error("❌ Invalid Credentials")
-        return
+def _require_admin():
+    """Abort 403 if the X-Admin-Key header doesn't match the configured password."""
+    key = request.headers.get("X-Admin-Key", "")
+    if not key or key != cfg.ADMIN_PASS:
+        abort(403, description="Invalid or missing X-Admin-Key header.")
 
-    st.success(f"✅ Authenticated as {ADMIN_USER}")
-    if st.button("Log Out"):
-        st.session_state["admin_logged_in"] = False
-        st.rerun()
-    
-    st.divider()
-    t1, t2, t3 = st.tabs(["📊 Global Analytics", "👷 Contractor Assignment", "⚙️ Data & Config"])
-    
-    # --- TAB 1: ANALYTICS ---
-    with t1:
-        st.subheader("🌍 City-Wide Road Intelligence")
-        if os.path.exists(CLOUD_DB_FILE):
-            with open(CLOUD_DB_FILE, "r") as f:
-                data = json.load(f)
-            
-            if not data:
-                st.info("Database is empty.")
-            else:
-                df = pd.DataFrame(data)
-                # Normalization
-                if 'road_name' not in df.columns: df['road_name'] = 'Unknown Road'
-                if 'severity' not in df.columns: df['severity'] = 'Minor'
-                if 'cost' not in df.columns: df['cost'] = 0.0
-                
-                # Top Metrics
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Total Potholes Detected", len(df))
-                total_cost = df['cost'].sum()
-                m2.metric("Total Repair Budget", f"${total_cost:,.2f}")
-                m3.metric("Critical Zones", df['road_name'].nunique())
-                st.divider()
-                
-                # Specific Road Analysis
-                st.subheader("🛣️ Road-Specific Breakdown")
-                unique_roads = df['road_name'].unique().tolist()
-                selected_road_analysis = st.selectbox("Select Road for Detail View:", unique_roads)
-                
-                if selected_road_analysis:
-                    road_df = df[df['road_name'] == selected_road_analysis]
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Potholes on Route", len(road_df))
-                    c2.metric("Severe Defects", len(road_df[road_df['severity'] == "Severe"]))
-                    c3.metric("Est. Repair Cost", f"${road_df['cost'].sum():,.2f}")
-                    st.bar_chart(road_df['severity'].value_counts())
 
-    # --- TAB 2: CONTRACTOR ASSIGNMENT ---
-    with t2:
-        st.subheader("👷 Assign Repair Work Order")
-        if os.path.exists(CLOUD_DB_FILE):
-            with open(CLOUD_DB_FILE, "r") as f:
-                data = json.load(f)
-            df = pd.DataFrame(data)
-            available_roads = df['road_name'].unique().tolist() if 'road_name' in df.columns else []
-        else:
-            available_roads = []
+# ---------------------------------------------------------------------------
+# Error handlers
+# ---------------------------------------------------------------------------
 
-        with st.form("contractor_form"):
-            c1, c2 = st.columns(2)
-            cont_name = c1.text_input("Contractor Name")
-            cont_phone = c2.text_input("Phone Number (with Country Code)", value="+91")
-            cont_corp = st.text_input("Corporation / Agency Name")
-            
-            target_road = st.selectbox("Select Target Road", available_roads)
-            
-            submitted = st.form_submit_button("🚀 Dispatch Work Order (SMS)")
-            
-            if submitted:
-                if target_road and cont_phone:
-                    road_data = df[df['road_name'] == target_road]
-                    count = len(road_data)
-                    budget = road_data['cost'].sum() if 'cost' in road_data else 0
-                    start_pt = f"{road_data.iloc[0]['lat']:.4f}, {road_data.iloc[0]['lon']:.4f}"
-                    
-                    sms_body = (
-                        f"WORK ORDER: {cont_corp}\n"
-                        f"Road: {target_road}\n"
-                        f"Defects: {count}\n"
-                        f"Budget: ${budget:,.2f}\n"
-                        f"Start Loc: {start_pt}\n"
-                        f"- Sent via Smart Road AI"
-                    )
-                    
-                    if send_sms_alert(cont_phone, sms_body):
-                        st.success(f"✅ Work Order sent to {cont_name} successfully!")
-                    
-                else:
-                    st.warning("Please select a road and enter a phone number.")
+@app.errorhandler(400)
+def bad_request(e):
+    return jsonify({"error": str(e.description)}), 400
 
-    # --- TAB 3: DATA & CONFIG ---
-    with t3:
-        st.subheader("⚙️ System Configuration")
-        st.markdown("##### 💰 Repair Cost Settings")
-        c1, c2, c3 = st.columns(3)
-        new_minor = c1.number_input("Minor ($)", value=st.session_state["cost_minor"])
-        new_mod = c2.number_input("Moderate ($)", value=st.session_state["cost_mod"])
-        new_sev = c3.number_input("Severe ($)", value=st.session_state["cost_sev"])
-        if st.button("💾 Save Pricing"):
-            st.session_state["cost_minor"] = new_minor
-            st.session_state["cost_mod"] = new_mod
-            st.session_state["cost_sev"] = new_sev
-            st.toast("Pricing updated!", icon="✅")
+@app.errorhandler(403)
+def forbidden(e):
+    return jsonify({"error": str(e.description)}), 403
 
-        st.divider()
-        st.markdown("##### 🗑️ Database Management")
-        if st.button("🔥 HARD RESET (Wipe All Data)", type="primary"):
-            if os.path.exists(CLOUD_DB_FILE):
-                os.remove(CLOUD_DB_FILE)
-                st.error("Database wiped.")
-                st.rerun()
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": str(e.description)}), 404
 
-def warning_system_tab(model, device):
-    st.header("⚠️ Live Road Warning System")
-    st.markdown("### 📡 Connected Vehicle Interface")
-    
-    img_file_buffer = st.camera_input("Scan Road (Live Feed)")
-    
-    if img_file_buffer is not None:
-        bytes_data = img_file_buffer.getvalue()
-        cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.pi.uint8), cv2.IMREAD_COLOR)
-        
-        mode = st.radio("System Mode", ["Scenario A: Known Road (Data Exists)", "Scenario B: New Road (Mapping Mode)"], horizontal=True)
-        
-        if "Scenario A" in mode:
-            if not os.path.exists(CLOUD_DB_FILE):
-                st.warning("Database empty. Switch to Mapping Mode.")
-            else:
-                with open(CLOUD_DB_FILE, "r") as f:
-                    cloud_data = json.load(f)
-                
-                if cloud_data:
-                    sim_user_lat = cloud_data[0]['lat']
-                    sim_user_lon = cloud_data[0]['lon']
-                    
-                    st.info(f"📍 GPS Locked: {sim_user_lat:.4f}, {sim_user_lon:.4f}")
-                    
-                    hazards = []
-                    for p in cloud_data:
-                        dist = geodesic((sim_user_lat, sim_user_lon), (p['lat'], p['lon'])).meters
-                        if dist < 500:
-                            hazards.append(p)
-                    
-                    if hazards:
-                        st.error(f"🚨 ALERT: {len(hazards)} Potholes detected in next 500m!")
-                        m = folium.Map(location=[sim_user_lat, sim_user_lon], zoom_start=17)
-                        folium.Marker([sim_user_lat, sim_user_lon], popup="You", icon=folium.Icon(color="blue", icon="car", prefix="fa")).add_to(m)
-                        for h in hazards:
-                            folium.CircleMarker([h['lat'], h['lon']], radius=6, color="red", fill=True, tooltip=h['severity']).add_to(m)
-                        st_folium(m, height=250, use_container_width=True)
-                        st.dataframe(pd.DataFrame(hazards)[['road_name', 'severity', 'lat', 'lon']])
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({"error": "File too large. Maximum upload size is 500 MB."}), 413
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({"error": "Internal server error. Check server logs."}), 500
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/", methods=["GET"])
+def root():
+    """Serve the HTML frontend from the project root (no templates/ folder needed)."""
+    return send_from_directory(".", "index.html")
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    model, _ = load_model(cfg.MODEL_PATH)
+    return jsonify({
+        "status": "ok",
+        "model_path": cfg.MODEL_PATH,
+        "model_loaded": model is not None,
+        "db_path": cfg.DATABASE_PATH,
+    })
+
+
+@app.route("/api/analyze", methods=["POST"])
+def analyze():
+    """
+    Multipart form fields:
+      video        — video file (mp4 / avi / mov / mkv / webm)
+      start_lat    — float
+      start_lon    — float
+      end_lat      — float
+      end_lon      — float
+      confidence   — float  (optional, default from config)
+      road_name    — string (optional override)
+      horizon      — bool   (optional, default true)
+      horizon_pct  — float  (optional, default 0.4)
+
+    Returns JSON with detections list and output_video URL.
+    """
+    if "video" not in request.files:
+        return jsonify({"error": "No video file uploaded. Use field name 'video'."}), 400
+
+    vid_file = request.files["video"]
+    if not vid_file.filename:
+        return jsonify({"error": "Uploaded file has no filename."}), 400
+
+    # Validate extension
+    ext = os.path.splitext(vid_file.filename)[1].lower()
+    if ext not in ALLOWED_VIDEO_EXTENSIONS:
+        return jsonify({"error": f"Unsupported file type '{ext}'. Allowed: {ALLOWED_VIDEO_EXTENSIONS}"}), 400
+
+    # Parse form params with defaults
+    try:
+        start_lat   = float(request.form.get("start_lat",  19.0760))
+        start_lon   = float(request.form.get("start_lon",  72.8777))
+        end_lat     = float(request.form.get("end_lat",    19.0800))
+        end_lon     = float(request.form.get("end_lon",    72.8800))
+        conf        = float(request.form.get("confidence", cfg.DEFAULT_CONFIDENCE))
+        horizon_pct = float(request.form.get("horizon_pct", 0.4))
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": f"Invalid numeric parameter: {e}"}), 400
+
+    manual_road      = request.form.get("road_name", "").strip()
+    enable_horizon   = request.form.get("horizon", "true").lower() != "false"
+
+    # Clamp confidence
+    conf = max(0.01, min(conf, 1.0))
+
+    model, device_type = load_model(cfg.MODEL_PATH)
+    if model is None:
+        return jsonify({"error": f"Model could not be loaded from '{cfg.MODEL_PATH}'. Check MODEL_PATH."}), 500
+
+    safe_name = _safe_filename(vid_file.filename)
+    tmp_dir   = tempfile.gettempdir()
+    input_path = os.path.join(tmp_dir, f"input_{safe_name}")
+    raw_out    = os.path.join(tmp_dir, f"raw_{safe_name}.mp4")
+    final_out  = os.path.join(tmp_dir, f"final_{safe_name}.mp4")
+
+    try:
+        vid_file.save(input_path)
+
+        # Fetch GIS data (non-fatal if it fails)
+        road_geom, road_names_data = fetch_gis_data(start_lat, start_lon, end_lat, end_lon)
+
+        # Open video
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            return jsonify({"error": "Could not open uploaded video. Check codec/format."}), 422
+
+        fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+        w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        horizon_y    = int(h * horizon_pct)
+
+        if w == 0 or h == 0:
+            cap.release()
+            return jsonify({"error": "Video has zero dimensions — possibly corrupted."}), 422
+
+        writer, writer_type = get_video_writer(raw_out, fps, w, h)
+
+        tracked   = []
+        records   = []
+        frame_idx = 0
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % cfg.FRAME_SKIP != 0:
+                writer.write(frame)
+                frame_idx += 1
+                continue
+
+            # Run inference — do NOT pass device kwarg here; it was set at load time
+            results = model(frame, conf=conf, verbose=False)
+
+            if enable_horizon:
+                cv2.line(frame, (0, horizon_y), (w, horizon_y), (255, 100, 0), 3)
+
+            for box_dat in results[0].boxes.data.cpu().numpy():
+                x1, y1, x2, y2, sc, cls = map(float, box_dat)
+                x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                area   = (x2 - x1) * (y2 - y1)
+
+                if enable_horizon and cy < horizon_y:
+                    continue
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"{sc:.2f}", (x1, y1 - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+                is_new = not any(
+                    math.sqrt((cx - t[0]) ** 2 + (cy - t[1]) ** 2) < cfg.DIST_THRESHOLD
+                    and (frame_idx - t[2]) < cfg.FRAME_COOLDOWN
+                    for t in tracked
+                )
+
+                if is_new:
+                    tracked.append((cx, cy, frame_idx))
+                    pct = frame_idx / total_frames
+
+                    if manual_road:
+                        final_name = manual_road
+                        lat = start_lat + (end_lat - start_lat) * pct
+                        lon = start_lon + (end_lon - start_lon) * pct
+                    elif road_geom:
+                        pt  = road_geom.interpolate(pct, normalized=True)
+                        lat, lon = pt.y, pt.x
+                        final_name = get_road_name_at_point(pt, road_names_data)
                     else:
-                        st.success("✅ Road Clear.")
+                        lat, lon   = start_lat, start_lon
+                        final_name = "Unknown Road"
 
-        else:
-            st.warning("⚠️ Unknown Territory. Mapping in Real-Time...")
-            results = model(cv2_img, conf=0.25, device=device)
-            detections = []
-            for box in results[0].boxes.data.cpu().numpy():
-                x1, y1, x2, y2, sc, cls = map(float, box)
-                area = (x2-x1)*(y2-y1)
-                sev = "Severe" if area > 8000 else ("Moderate" if area > 2000 else "Minor")
-                cv2.rectangle(cv2_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
-                detections.append({
-                    "Latitude": 19.0760, 
-                    "Longitude": 72.8777,
-                    "Road_Name": "Live Scanned Road",
-                    "Severity": sev,
-                    "Est_Cost": 150
-                })
-            
-            st.image(cv2_img, channels="BGR", caption="Real-Time Analysis")
-            if detections:
-                save_to_cloud_db(detections, "Live Camera")
-                st.toast(f"Saved {len(detections)} new potholes to DB!", icon="💾")
+                    sev = "Severe" if area > 8000 else ("Moderate" if area > 2000 else "Minor")
+                    records.append({
+                        "lat":       lat,
+                        "lon":       lon,
+                        "road_name": final_name,
+                        "severity":  sev,
+                        "cost":      _pricing[sev],
+                    })
 
-def user_dashboard(model, device_type):
-    st.title("🛣️ Smart Road Dashboard")
-    conf = st.session_state["global_conf"]
-    
-    # --- INPUT SECTION ---
-    c1, c2 = st.columns([1, 2])
-    
-    with c1:
-        st.markdown("### 1. Route Configuration")
-        # Manual Overrides
-        enable_horizon = st.checkbox("Enable Horizon Filter", value=True)
-        horizon_pct = st.slider("Filter Level", 0.0, 1.0, 0.4, 0.05) if enable_horizon else 0.0
-        manual_road_name = st.text_input("Road Name", placeholder="e.g. NH-44")
-        
-        st.divider()
-        st.markdown("#### 🗺️ Coordinate Selection")
-        
-        # --- MAP SELECTION LOGIC ---
-        selection_mode = st.radio("Click Map to Set:", ["🟢 Set Start Point", "🔴 Set End Point"], horizontal=True)
-        
-        # Display Current Coords
-        c_lat, c_lon = st.columns(2)
-        c_lat.caption(f"Start: {st.session_state.start_lat:.4f}, {st.session_state.start_lon:.4f}")
-        c_lon.caption(f"End:   {st.session_state.end_lat:.4f}, {st.session_state.end_lon:.4f}")
+            writer.write(frame)
+            frame_idx += 1
 
-        # Interactive Map
-        m = folium.Map(location=[st.session_state.start_lat, st.session_state.start_lon], zoom_start=13)
-        
-        # Draw Markers
-        folium.Marker(
-            [st.session_state.start_lat, st.session_state.start_lon], 
-            popup="Start", 
-            icon=folium.Icon(color="green", icon="play")
-        ).add_to(m)
-        
-        folium.Marker(
-            [st.session_state.end_lat, st.session_state.end_lon], 
-            popup="End", 
-            icon=folium.Icon(color="red", icon="stop")
-        ).add_to(m)
-        
-        # Draw connecting line
-        folium.PolyLine(
-            [(st.session_state.start_lat, st.session_state.start_lon), 
-             (st.session_state.end_lat, st.session_state.end_lon)],
-            color="blue", weight=2, opacity=0.5, dash_array='5, 5'
-        ).add_to(m)
+        cap.release()
+        writer.release()
 
-        m.add_child(folium.LatLngPopup()) 
-        
-        map_out = st_folium(m, height=300, width=400)
-        
-        # Handle Clicks
-        if map_out.get("last_clicked"):
-            coords = map_out["last_clicked"]
-            if "Start Point" in selection_mode:
-                if coords['lat'] != st.session_state.start_lat:
-                    st.session_state.start_lat = coords['lat']
-                    st.session_state.start_lon = coords['lng']
-                    st.rerun()
-            elif "End Point" in selection_mode:
-                if coords['lat'] != st.session_state.end_lat:
-                    st.session_state.end_lat = coords['lat']
-                    st.session_state.end_lon = coords['lng']
-                    st.rerun()
-
-    with c2:
-        st.markdown("### 2. Upload & Analyze")
-        vid_file = st.file_uploader("Upload Video", ["mp4", "avi"], key=f"uploader_{st.session_state.uploader_key}")
-        
-        if vid_file:
-            if st.button("🚀 Start Analysis", type="primary"):
-                st.session_state.video_id = vid_file.name
-                
-                with st.spinner("🗺️ Fetching GIS Data..."):
-                    road_geom, road_names_data = fetch_gis_data(st.session_state.start_lat, st.session_state.start_lon, st.session_state.end_lat, st.session_state.end_lon)
-                    st.session_state.road_geom = road_geom
-                    st.session_state.road_names = road_names_data
-
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                    tmp.write(vid_file.read())
-                    input_path = tmp.name
-
-                cap = cv2.VideoCapture(input_path)
-                fps = cap.get(cv2.CAP_PROP_FPS) or 25
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                w, h = int(cap.get(3)), int(cap.get(4))
-                horizon_y = int(h * horizon_pct)
-                
-                if has_ffmpeg():
-                    raw_out = os.path.join(tempfile.gettempdir(), "raw_temp.mp4")
-                    out, method = get_video_writer(raw_out, fps, w, h)
-                else:
-                    raw_out = os.path.join(tempfile.gettempdir(), "raw_temp.webm")
-                    out, method = get_video_writer(raw_out, fps, w, h)
-
-                tracked = []
-                frame_idx = 0
-                prog_bar = st.progress(0)
-                status_txt = st.empty()
-                st.session_state.records = []
-
-                while cap.isOpened():
-                    ret, frame = cap.read()
-                    if not ret: break
-
-                    if frame_idx % FRAME_SKIP != 0:
-                        out.write(frame)
-                        frame_idx += 1
-                        continue
-
-                    results = model(frame, conf=conf, device=device_type, verbose=False)
-                    
-                    if enable_horizon:
-                        cv2.line(frame, (0, horizon_y), (w, horizon_y), (255, 100, 0), 3)
-                    
-                    for box_dat in results[0].boxes.data.cpu().numpy(): 
-                        x1, y1, x2, y2, sc, cls = map(float, box_dat)
-                        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-                        cx, cy = (x1+x2)//2, (y1+y2)//2
-                        area = (x2-x1)*(y2-y1)
-
-                        if enable_horizon and cy < horizon_y: continue 
-
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                        is_new = True
-                        for t in tracked:
-                            dist = math.sqrt((cx-t[0])**2 + (cy-t[1])**2)
-                            if dist < DIST_THRESHOLD and (frame_idx - t[2]) < FRAME_COOLDOWN:
-                                is_new = False; break
-                        
-                        if is_new:
-                            tracked.append((cx, cy, frame_idx))
-                            
-                            final_name = "Unknown Road"
-                            if manual_road_name:
-                                final_name = manual_road_name
-                                pct = frame_idx / total_frames if total_frames > 0 else 0
-                                lat = st.session_state.start_lat + (st.session_state.end_lat - st.session_state.start_lat) * pct
-                                lon = st.session_state.start_lon + (st.session_state.end_lon - st.session_state.start_lon) * pct
-                            else:
-                                if st.session_state.road_geom:
-                                    pct = frame_idx / total_frames if total_frames > 0 else 0
-                                    pt = st.session_state.road_geom.interpolate(pct, normalized=True)
-                                    lat, lon = pt.y, pt.x
-                                    if st.session_state.road_names:
-                                        final_name = get_road_name_at_point(pt, st.session_state.road_names)
-                                else:
-                                    lat, lon = st.session_state.start_lat, st.session_state.start_lon
-
-                            sev = "Severe" if area > 8000 else ("Moderate" if area > 2000 else "Minor")
-                            
-                            cost_map = {
-                                "Minor": st.session_state["cost_minor"],
-                                "Moderate": st.session_state["cost_mod"],
-                                "Severe": st.session_state["cost_sev"]
-                            }
-
-                            st.session_state.records.append({
-                                "Latitude": lat, "Longitude": lon,
-                                "Road_Name": final_name,
-                                "Severity": sev, "Est_Cost": cost_map[sev]
-                            })
-
-                    out.write(frame)
-                    frame_idx += 1
-                    if frame_idx % 20 == 0:
-                        prog_bar.progress(min(frame_idx/total_frames, 1.0))
-                        status_txt.text(f"Processing... {int((frame_idx/total_frames)*100)}%")
-
-                cap.release()
-                out.release()
-                
-                save_to_cloud_db(st.session_state.records, st.session_state.video_id)
-                final_path = os.path.join(tempfile.gettempdir(), "final_output_web.mp4")
-                final_path, mime = convert_video_for_browser(raw_out, final_path)
-                st.session_state.output_video_path = final_path
-                st.session_state.output_mime = mime
-                st.session_state.video_processed = True
-                st.rerun()
-
-    # --- RESULTS SECTION ---
-    if st.session_state.video_processed:
-        st.divider()
-        st.subheader("🏁 Analysis Results")
-        
-        c_res1, c_res2 = st.columns(2)
-        with c_res1:
-            st.markdown("**Processed Video**")
+    except Exception as e:
+        log.exception("Error during video analysis")
+        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
+    finally:
+        # Always clean up input temp file
+        if os.path.exists(input_path):
             try:
-                with open(st.session_state.output_video_path, "rb") as f:
-                    st.video(f.read(), format=st.session_state.output_mime)
-            except: st.error("Video Error")
-        
-        with c_res2:
-            st.markdown("**Risk Map**")
-            df = pd.DataFrame(st.session_state.records)
-            if not df.empty and st.session_state.road_geom:
-                 m = folium.Map(location=[st.session_state.start_lat, st.session_state.start_lon], zoom_start=14)
-                 folium.GeoJson(st.session_state.road_geom, style_function=lambda x: {'color':'blue','weight':4}).add_to(m)
-                 HeatMap(df[['Latitude', 'Longitude']].values, radius=15).add_to(m)
-                 st_folium(m, height=350, use_container_width=True)
-            else:
-                st.info("No geospatial data available.")
+                os.remove(input_path)
+            except OSError:
+                pass
 
-        if st.button("🔄 Reset System", type="primary"):
-            st.session_state["video_id"] = None
-            st.session_state["video_processed"] = False
-            st.session_state["records"] = []
-            st.session_state["road_geom"] = None
-            st.session_state["uploader_key"] += 1
-            st.rerun()
+    # Persist to DB
+    if records:
+        db.add_potholes_batch(records, vid_file.filename)
 
-# =========================
-# 8. APP EXECUTION
-# =========================
-selected_page, model, device = sidebar_nav()
+    # Convert for browser playback
+    final_path, mime = convert_video_for_browser(raw_out, final_out)
+    video_url = f"/api/video/{os.path.basename(final_path)}"
 
-if model is None:
-    st.error("⚠️ Model not found. Please check path in Admin Panel.")
-else:
-    if selected_page == "Dashboard":
-        user_dashboard(model, device)
-    elif selected_page == "Live Warnings":
-        warning_system_tab(model, device)
-    elif selected_page == "Admin Panel":
-        admin_panel()
+    return jsonify({
+        "video_id":         safe_name,
+        "original_filename": vid_file.filename,
+        "total_detections": len(records),
+        "records":          records,
+        "output_video_url": video_url,
+        "output_mime":      mime,
+    })
+
+
+@app.route("/api/video/<filename>", methods=["GET"])
+def serve_video(filename: str):
+    # Prevent path traversal
+    filename = os.path.basename(filename)
+    path = os.path.join(tempfile.gettempdir(), filename)
+    if not os.path.isfile(path):
+        abort(404, description="Video not found or has expired.")
+    mime = "video/webm" if filename.endswith(".webm") else "video/mp4"
+    return send_file(path, mimetype=mime, conditional=True)
+
+
+@app.route("/api/records", methods=["GET"])
+def get_records():
+    try:
+        page  = max(1, int(request.args.get("page",  1)))
+        limit = max(1, min(int(request.args.get("limit", 100)), 1000))
+    except (TypeError, ValueError):
+        return jsonify({"error": "page and limit must be integers."}), 400
+
+    rows  = db.get_all()
+    start = (page - 1) * limit
+    return jsonify({
+        "page":    page,
+        "limit":   limit,
+        "total":   len(rows),
+        "records": rows[start: start + limit],
+    })
+
+
+@app.route("/api/stats", methods=["GET"])
+def get_stats():
+    return jsonify(db.get_stats())
+
+
+@app.route("/api/roads", methods=["GET"])
+def get_roads():
+    return jsonify({"roads": db.get_unique_roads()})
+
+
+@app.route("/api/roads/<path:road_name>", methods=["GET"])
+def get_road_detail(road_name: str):
+    rows = db.get_by_road(road_name)
+    if not rows:
+        return jsonify({"error": f"No records found for road: '{road_name}'."}), 404
+    df = pd.DataFrame(rows)
+    return jsonify({
+        "road_name":    road_name,
+        "total":        len(rows),
+        "severe_count": int((df["severity"] == "Severe").sum()),
+        "total_cost":   float(df["cost"].sum()),
+        "records":      rows,
+    })
+
+
+@app.route("/api/dispatch", methods=["POST"])
+def dispatch():
+    """
+    JSON body:
+      contractor_name  — str
+      phone            — str  (E.164 format, e.g. +919876543210)
+      corporation      — str
+      road_name        — str
+    Requires X-Admin-Key header.
+    """
+    _require_admin()
+    data = request.get_json(force=True) or {}
+
+    road_name   = data.get("road_name",        "").strip()
+    phone       = data.get("phone",            "").strip()
+    cont_name   = data.get("contractor_name", "Contractor")
+    corporation = data.get("corporation",     "")
+
+    if not road_name or not phone:
+        return jsonify({"error": "Both 'road_name' and 'phone' fields are required."}), 400
+
+    # Basic E.164 format check
+    if not re.match(r"^\+\d{7,15}$", phone):
+        return jsonify({"error": "Phone must be in E.164 format, e.g. +919876543210."}), 400
+
+    road_rows = db.get_by_road(road_name)
+    if not road_rows:
+        return jsonify({"error": f"No records found for road: '{road_name}'."}), 404
+
+    road_df  = pd.DataFrame(road_rows)
+    count    = len(road_df)
+    budget   = road_df["cost"].sum()
+    start_pt = (
+        f"{road_df.iloc[0]['lat']:.4f}, {road_df.iloc[0]['lon']:.4f}"
+        if count else "N/A"
+    )
+
+    sms_body = (
+        f"WORK ORDER: {corporation}\n"
+        f"Contractor: {cont_name}\n"
+        f"Road: {road_name}\n"
+        f"Defects: {count}\n"
+        f"Budget: \u20b9{budget:,.2f}\n"
+        f"Start: {start_pt}\n"
+        f"- Smart Road AI"
+    )
+
+    ok = send_sms_alert(phone, sms_body)
+    if ok:
+        return jsonify({"status": "dispatched", "sms_body": sms_body})
+    return jsonify({"error": "SMS delivery failed. Check server logs for details."}), 500
+
+
+@app.route("/api/admin/reset", methods=["POST"])
+def admin_reset():
+    _require_admin()
+    db.reset()
+    log.warning("Database reset triggered via API.")
+    return jsonify({"status": "reset", "message": "All pothole records deleted."})
+
+
+@app.route("/api/admin/pricing", methods=["POST"])
+def admin_pricing():
+    """
+    JSON body:
+      minor    — float
+      moderate — float
+      severe   — float
+    Requires X-Admin-Key header.
+    """
+    _require_admin()
+    data = request.get_json(force=True) or {}
+    errors = []
+    for key, field in [("minor", "Minor"), ("moderate", "Moderate"), ("severe", "Severe")]:
+        if key in data:
+            try:
+                val = float(data[key])
+                if val < 0:
+                    errors.append(f"'{key}' must be non-negative.")
+                else:
+                    _pricing[field] = val
+            except (TypeError, ValueError):
+                errors.append(f"'{key}' must be a number.")
+    if errors:
+        return jsonify({"error": errors}), 400
+    return jsonify({"status": "updated", "pricing": _pricing})
+
+
+@app.route("/api/hazards", methods=["GET"])
+def get_hazards():
+    """
+    Query params: lat, lon, radius_m (default 500)
+    Returns potholes within radius_m metres of the given point.
+    """
+    try:
+        lat      = float(request.args["lat"])
+        lon      = float(request.args["lon"])
+        radius_m = float(request.args.get("radius_m", 500))
+    except (KeyError, ValueError):
+        return jsonify({"error": "'lat' and 'lon' query params are required and must be floats."}), 400
+
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        return jsonify({"error": "lat must be in [-90,90] and lon in [-180,180]."}), 400
+
+    all_rows = db.get_all()
+    hazards  = [
+        p for p in all_rows
+        if geodesic((lat, lon), (p["lat"], p["lon"])).meters < radius_m
+    ]
+    return jsonify({
+        "lat":      lat,
+        "lon":      lon,
+        "radius_m": radius_m,
+        "count":    len(hazards),
+        "hazards":  hazards,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Entry point (local dev only — Render uses Gunicorn)
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    log.info(f"Starting Smart Road Intelligence on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=cfg.DEBUG)

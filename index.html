@@ -1,0 +1,1239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Road Intelligence</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@400;500;600;700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root {
+    --bg:        #0a0c0f;
+    --surface:   #111418;
+    --border:    #1e2530;
+    --accent:    #f5a623;
+    --accent2:   #e03c3c;
+    --accent3:   #3ce08a;
+    --text:      #d4dae6;
+    --muted:     #5a6478;
+    --mono:      'Share Tech Mono', monospace;
+    --sans:      'Barlow', sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Scanline overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.08) 2px,
+      rgba(0,0,0,0.08) 4px
+    );
+    pointer-events: none;
+    z-index: 1000;
+  }
+
+  /* ── HEADER ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 32px;
+    height: 60px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+  }
+
+  .logo-icon {
+    width: 28px; height: 28px;
+    background: var(--accent);
+    clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+    animation: pulse-hex 3s ease-in-out infinite;
+  }
+
+  @keyframes pulse-hex {
+    0%,100% { opacity:1; }
+    50% { opacity:.6; }
+  }
+
+  .status-bar {
+    display: flex;
+    gap: 20px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .status-dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--accent3);
+    margin-right: 6px;
+    animation: blink 2s step-end infinite;
+  }
+
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* ── NAV TABS ── */
+  nav {
+    display: flex;
+    gap: 0;
+    padding: 0 32px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .tab {
+    padding: 12px 24px;
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all .2s;
+    text-transform: uppercase;
+    user-select: none;
+  }
+
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* ── LAYOUT ── */
+  main { padding: 28px 32px; max-width: 1400px; margin: 0 auto; }
+
+  .page { display: none; animation: fadein .3s ease; }
+  .page.active { display: block; }
+
+  @keyframes fadein { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+
+  /* ── STAT CARDS ── */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 28px;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0;
+    width: 3px; height: 100%;
+    background: var(--accent);
+  }
+
+  .stat-card.green::before  { background: var(--accent3); }
+  .stat-card.red::before    { background: var(--accent2); }
+  .stat-card.orange::before { background: var(--accent); }
+
+  .stat-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: .12em;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .stat-value {
+    font-family: var(--mono);
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--text);
+    line-height: 1;
+  }
+
+  .stat-value.accent  { color: var(--accent); }
+  .stat-value.red     { color: var(--accent2); }
+  .stat-value.green   { color: var(--accent3); }
+
+  /* ── GRID ── */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
+
+  /* ── PANEL ── */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 24px;
+    margin-bottom: 20px;
+  }
+
+  .panel-title {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 18px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .panel-title::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* ── MAP ── */
+  #map, #map2 {
+    height: 380px;
+    border: 1px solid var(--border);
+    filter: grayscale(40%) brightness(0.85);
+  }
+
+  /* ── UPLOAD ZONE ── */
+  .upload-zone {
+    border: 2px dashed var(--border);
+    padding: 40px;
+    text-align: center;
+    cursor: pointer;
+    transition: all .2s;
+    position: relative;
+  }
+
+  .upload-zone:hover, .upload-zone.drag { border-color: var(--accent); background: rgba(245,166,35,.04); }
+
+  .upload-zone input { position:absolute; inset:0; opacity:0; cursor:pointer; }
+
+  .upload-icon { font-size: 36px; margin-bottom: 12px; }
+
+  .upload-label {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  .upload-label span { color: var(--accent); }
+
+  /* ── FORM ── */
+  .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+  .form-group { display: flex; flex-direction: column; gap: 6px; }
+
+  label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  input[type=text], input[type=number], input[type=password], input[type=range], select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 12px;
+    font-family: var(--mono);
+    font-size: 13px;
+    outline: none;
+    width: 100%;
+    transition: border-color .2s;
+  }
+
+  input:focus, select:focus { border-color: var(--accent); }
+
+  .checkbox-row {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    margin-bottom: 14px; cursor: pointer;
+  }
+
+  input[type=checkbox] { accent-color: var(--accent); width:14px; height:14px; cursor:pointer; }
+
+  /* ── BUTTONS ── */
+  .btn {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 12px 28px;
+    border: none;
+    cursor: pointer;
+    transition: all .15s;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #000;
+    font-weight: 700;
+  }
+
+  .btn-primary:hover { background: #ffc355; }
+  .btn-primary:disabled { opacity: .4; cursor: not-allowed; }
+
+  .btn-danger {
+    background: transparent;
+    border: 1px solid var(--accent2);
+    color: var(--accent2);
+  }
+
+  .btn-danger:hover { background: rgba(224,60,60,.1); }
+
+  .btn-ghost {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+
+  .btn-ghost:hover { border-color: var(--text); color: var(--text); }
+
+  /* ── PROGRESS ── */
+  .progress-wrap {
+    display: none;
+    margin: 16px 0;
+  }
+
+  .progress-wrap.visible { display: block; }
+
+  .progress-bar-outer {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    height: 8px;
+    overflow: hidden;
+  }
+
+  .progress-bar-inner {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width .3s;
+    position: relative;
+  }
+
+  .progress-bar-inner::after {
+    content: '';
+    position: absolute;
+    right: 0; top: 0; bottom: 0;
+    width: 20px;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,.4));
+  }
+
+  .progress-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+
+  /* ── TABLE ── */
+  .data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  .data-table th {
+    text-align: left;
+    padding: 10px 14px;
+    color: var(--muted);
+    font-size: 10px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .data-table td {
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(30,37,48,.6);
+    color: var(--text);
+  }
+
+  .data-table tr:hover td { background: rgba(255,255,255,.02); }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    font-size: 10px;
+    letter-spacing: .08em;
+    font-weight: 600;
+  }
+
+  .badge-minor    { background: rgba(90,100,120,.3);  color: #8a9ab5; }
+  .badge-moderate { background: rgba(245,166,35,.15); color: var(--accent); }
+  .badge-severe   { background: rgba(224,60,60,.15);  color: var(--accent2); }
+
+  /* ── ALERTS ── */
+  .alert {
+    padding: 12px 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+    border-left: 3px solid;
+    margin-bottom: 16px;
+    display: none;
+  }
+
+  .alert.visible { display: block; }
+  .alert-error  { border-color: var(--accent2); background: rgba(224,60,60,.08); color: var(--accent2); }
+  .alert-success{ border-color: var(--accent3); background: rgba(60,224,138,.08); color: var(--accent3); }
+  .alert-info   { border-color: var(--accent);  background: rgba(245,166,35,.08); color: var(--accent); }
+
+  /* ── RESULT VIDEO ── */
+  video {
+    width: 100%;
+    max-height: 320px;
+    background: #000;
+    display: block;
+    border: 1px solid var(--border);
+  }
+
+  /* ── ADMIN ── */
+  .login-box {
+    max-width: 360px;
+    margin: 60px auto;
+    padding: 36px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+  }
+
+  .admin-section { display: none; }
+  .admin-section.visible { display: block; }
+
+  /* ── SEVERITY BARS ── */
+  .sev-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .sev-name { font-family: var(--mono); font-size: 11px; width: 70px; color: var(--muted); }
+  .sev-bar-outer { flex:1; background: var(--bg); height: 8px; border: 1px solid var(--border); }
+  .sev-bar-inner { height: 100%; transition: width .6s ease; }
+  .sev-count { font-family: var(--mono); font-size: 11px; color: var(--text); width: 30px; text-align: right; }
+
+  /* ── RESPONSIVE ── */
+  @media (max-width: 900px) {
+    .stats-row { grid-template-columns: repeat(2,1fr); }
+    .grid-2 { grid-template-columns: 1fr; }
+    .grid-3 { grid-template-columns: 1fr; }
+    main { padding: 16px; }
+    header { padding: 0 16px; }
+    nav { padding: 0 16px; overflow-x: auto; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">🛣</div>
+    SMART ROAD INTELLIGENCE / v2.0
+  </div>
+  <div class="status-bar">
+    <span><span class="status-dot"></span>SYSTEM ONLINE</span>
+    <span id="hdr-total">— RECORDS</span>
+    <span id="hdr-time">--:--:--</span>
+  </div>
+</header>
+
+<nav>
+  <div class="tab active" data-page="dashboard">[ Dashboard ]</div>
+  <div class="tab" data-page="analyze">[ Analyze ]</div>
+  <div class="tab" data-page="hazards">[ Hazard Map ]</div>
+  <div class="tab" data-page="records">[ Records ]</div>
+  <div class="tab" data-page="admin">[ Admin ]</div>
+</nav>
+
+<main>
+
+  <!-- ══════════════════════════════════════════════ DASHBOARD ══ -->
+  <div class="page active" id="page-dashboard">
+
+    <div class="stats-row">
+      <div class="stat-card orange">
+        <div class="stat-label">Total Potholes</div>
+        <div class="stat-value accent" id="s-total">—</div>
+      </div>
+      <div class="stat-card red">
+        <div class="stat-label">Severe</div>
+        <div class="stat-value red" id="s-severe">—</div>
+      </div>
+      <div class="stat-card green">
+        <div class="stat-label">Roads Affected</div>
+        <div class="stat-value green" id="s-zones">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Est. Repair Budget</div>
+        <div class="stat-value" id="s-cost">—</div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-title">City-Wide Pothole Map</div>
+        <div id="map"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Severity Breakdown</div>
+        <div id="sev-chart" style="margin-top:12px;"></div>
+        <div style="margin-top:28px;">
+          <div class="panel-title">Top Roads by Defects</div>
+          <div id="roads-list" style="font-family:var(--mono);font-size:12px;color:var(--muted);">Loading...</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ══════════════════════════════════════════════ ANALYZE ══ -->
+  <div class="page" id="page-analyze">
+
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-title">Upload Inspection Video</div>
+
+        <div class="upload-zone" id="upload-zone">
+          <input type="file" id="video-input" accept=".mp4,.avi">
+          <div class="upload-icon">📹</div>
+          <div class="upload-label">Drop video here or <span>browse files</span></div>
+          <div id="file-name" style="margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--accent);"></div>
+        </div>
+
+        <div style="margin-top:20px;">
+          <div class="panel-title">Route Coordinates</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Start Latitude</label>
+              <input type="number" id="start-lat" value="19.0760" step="0.0001">
+            </div>
+            <div class="form-group">
+              <label>Start Longitude</label>
+              <input type="number" id="start-lon" value="72.8777" step="0.0001">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>End Latitude</label>
+              <input type="number" id="end-lat" value="19.0800" step="0.0001">
+            </div>
+            <div class="form-group">
+              <label>End Longitude</label>
+              <input type="number" id="end-lon" value="72.8800" step="0.0001">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Confidence Threshold</label>
+              <input type="number" id="confidence" value="0.25" min="0.1" max="0.9" step="0.05">
+            </div>
+            <div class="form-group">
+              <label>Road Name Override</label>
+              <input type="text" id="road-name" placeholder="e.g. NH-44 (optional)">
+            </div>
+          </div>
+          <label class="checkbox-row">
+            <input type="checkbox" id="horizon-check" checked>
+            Enable Horizon Filter (ignore sky / overhead objects)
+          </label>
+
+          <div id="analyze-alert" class="alert"></div>
+
+          <div class="progress-wrap" id="progress-wrap">
+            <div class="progress-label" id="progress-label">Uploading video…</div>
+            <div class="progress-bar-outer">
+              <div class="progress-bar-inner" id="progress-bar"></div>
+            </div>
+          </div>
+
+          <button class="btn btn-primary" id="analyze-btn" style="width:100%;justify-content:center;margin-top:4px;">
+            ▶ START ANALYSIS
+          </button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Analysis Results</div>
+        <div id="result-placeholder" style="color:var(--muted);font-family:var(--mono);font-size:12px;padding:40px 0;text-align:center;">
+          Upload a video and start analysis to see results here.
+        </div>
+        <div id="result-content" style="display:none;">
+          <div class="stats-row" style="grid-template-columns:1fr 1fr 1fr;margin-bottom:20px;">
+            <div class="stat-card orange">
+              <div class="stat-label">Detected</div>
+              <div class="stat-value accent" id="r-total">0</div>
+            </div>
+            <div class="stat-card red">
+              <div class="stat-label">Severe</div>
+              <div class="stat-value red" id="r-severe">0</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Est. Cost</div>
+              <div class="stat-value" id="r-cost">₹0</div>
+            </div>
+          </div>
+
+          <div style="margin-bottom:16px;">
+            <div class="panel-title">Processed Video</div>
+            <video id="result-video" controls playsinline preload="auto" style="width:100%;max-height:320px;background:#000;display:block;border:1px solid var(--border);"></video>
+          </div>
+
+          <div>
+            <div class="panel-title">Detection Log</div>
+            <div style="max-height:200px;overflow-y:auto;">
+              <table class="data-table">
+                <thead>
+                  <tr><th>Road</th><th>Severity</th><th>Lat</th><th>Lon</th><th>Cost</th></tr>
+                </thead>
+                <tbody id="result-table"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ══════════════════════════════════════════════ HAZARDS ══ -->
+  <div class="page" id="page-hazards">
+    <div class="panel">
+      <div class="panel-title">Hazard Proximity Scanner</div>
+      <div class="form-row" style="max-width:500px;">
+        <div class="form-group">
+          <label>Latitude</label>
+          <input type="number" id="hz-lat" value="19.0760" step="0.0001">
+        </div>
+        <div class="form-group">
+          <label>Longitude</label>
+          <input type="number" id="hz-lon" value="72.8777" step="0.0001">
+        </div>
+        <div class="form-group">
+          <label>Radius (metres)</label>
+          <input type="number" id="hz-radius" value="500" min="50" max="5000" step="50">
+        </div>
+        <div class="form-group" style="justify-content:flex-end;">
+          <button class="btn btn-primary" id="hz-scan-btn">⬡ SCAN</button>
+        </div>
+      </div>
+      <div id="hz-alert" class="alert" style="max-width:500px;"></div>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-title">Proximity Map</div>
+        <div id="map2"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Nearby Hazards</div>
+        <div id="hz-count" style="font-family:var(--mono);font-size:13px;color:var(--muted);margin-bottom:16px;">
+          Run a scan to see results.
+        </div>
+        <div style="max-height:320px;overflow-y:auto;">
+          <table class="data-table">
+            <thead><tr><th>Road</th><th>Severity</th><th>Distance</th></tr></thead>
+            <tbody id="hz-table"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════ RECORDS ══ -->
+  <div class="page" id="page-records">
+    <div class="panel">
+      <div class="panel-title">All Pothole Records</div>
+      <div style="display:flex;gap:12px;margin-bottom:16px;align-items:center;flex-wrap:wrap;">
+        <input type="text" id="records-filter" placeholder="Filter by road name…" style="max-width:260px;">
+        <button class="btn btn-ghost" id="records-refresh">↻ REFRESH</button>
+        <span id="records-count" style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-left:auto;"></span>
+        <button class="btn btn-danger" id="records-reset-btn" title="Requires admin password">⚠ HARD RESET</button>
+      </div>
+      <div id="records-reset-prompt" style="display:none;background:rgba(224,60,60,0.06);border:1px solid rgba(224,60,60,0.3);padding:16px;margin-bottom:14px;">
+        <div style="font-family:var(--mono);font-size:11px;color:var(--accent2);margin-bottom:10px;letter-spacing:.08em;">CONFIRM HARD RESET — THIS CANNOT BE UNDONE</div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+          <input type="password" id="records-reset-pass" placeholder="Enter admin password…" style="max-width:240px;border-color:rgba(224,60,60,0.4);">
+          <button class="btn btn-danger" id="records-reset-confirm">CONFIRM DELETE ALL</button>
+          <button class="btn btn-ghost" id="records-reset-cancel">CANCEL</button>
+        </div>
+      </div>
+      <div id="records-reset-alert" class="alert" style="margin-bottom:10px;"></div>
+      <div style="overflow-x:auto;">
+        <table class="data-table">
+          <thead>
+            <tr><th>#</th><th>Road</th><th>Severity</th><th>Latitude</th><th>Longitude</th><th>Est. Cost</th><th>Recorded</th></tr>
+          </thead>
+          <tbody id="records-table"></tbody>
+        </table>
+      </div>
+      <div id="records-pagination" style="display:flex;gap:8px;margin-top:14px;align-items:center;font-family:var(--mono);font-size:11px;color:var(--muted);"></div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════ ADMIN ══ -->
+  <div class="page" id="page-admin">
+
+    <div class="login-box" id="admin-login">
+      <div class="panel-title">Admin Authentication</div>
+      <div class="form-group" style="margin-bottom:14px;">
+        <label>Admin Password</label>
+        <input type="password" id="admin-pass" placeholder="Enter ADMIN_PASS">
+      </div>
+      <div id="login-alert" class="alert"></div>
+      <button class="btn btn-primary" id="login-btn" style="width:100%;justify-content:center;">
+        UNLOCK SYSTEM
+      </button>
+    </div>
+
+    <div class="admin-section" id="admin-panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+        <span style="font-family:var(--mono);font-size:12px;color:var(--accent3);">
+          <span class="status-dot"></span>AUTHENTICATED
+        </span>
+        <button class="btn btn-ghost" id="logout-btn">LOG OUT</button>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-title">Repair Cost Configuration</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Minor Defect (₹)</label>
+              <input type="number" id="cost-minor" value="50">
+            </div>
+            <div class="form-group">
+              <label>Moderate Defect (₹)</label>
+              <input type="number" id="cost-moderate" value="150">
+            </div>
+          </div>
+          <div class="form-group" style="margin-bottom:16px;">
+            <label>Severe Defect (₹)</label>
+            <input type="number" id="cost-severe" value="400">
+          </div>
+          <div id="pricing-alert" class="alert"></div>
+          <button class="btn btn-primary" id="save-pricing-btn">SAVE PRICING</button>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Dispatch Work Order via SMS</div>
+          <div class="form-group" style="margin-bottom:12px;">
+            <label>Contractor Name</label>
+            <input type="text" id="d-name" placeholder="e.g. Ramesh Patil">
+          </div>
+          <div class="form-group" style="margin-bottom:12px;">
+            <label>Phone (E.164 format)</label>
+            <input type="text" id="d-phone" placeholder="+919876543210">
+          </div>
+          <div class="form-group" style="margin-bottom:12px;">
+            <label>Corporation / Agency</label>
+            <input type="text" id="d-corp" placeholder="e.g. Mumbai Roads Dept.">
+          </div>
+          <div class="form-group" style="margin-bottom:16px;">
+            <label>Target Road</label>
+            <select id="d-road"><option value="">-- select road --</option></select>
+          </div>
+          <div id="dispatch-alert" class="alert"></div>
+          <button class="btn btn-primary" id="dispatch-btn">📱 DISPATCH SMS</button>
+        </div>
+      </div>
+
+      <div class="panel" style="border-color:rgba(224,60,60,.3);">
+        <div class="panel-title" style="color:var(--accent2);">Danger Zone</div>
+        <p style="font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:16px;">
+          Permanently deletes all pothole records from the database. This cannot be undone.
+        </p>
+        <div id="reset-alert" class="alert"></div>
+        <button class="btn btn-danger" id="reset-btn">⚠ HARD RESET — WIPE ALL DATA</button>
+      </div>
+    </div>
+
+  </div>
+
+</main>
+
+<script>
+// ── CONFIG ──────────────────────────────────────────────────────────────────
+const API = '';  // same origin — Flask serves this HTML
+
+// ── UTILS ───────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+function showAlert(el, msg, type='error') {
+  el.textContent = msg;
+  el.className = `alert visible alert-${type}`;
+}
+function hideAlert(el) { el.className = 'alert'; }
+
+function badgeHtml(sev) {
+  const cls = sev === 'Severe' ? 'badge-severe' : sev === 'Moderate' ? 'badge-moderate' : 'badge-minor';
+  return `<span class="badge ${cls}">${sev}</span>`;
+}
+
+function fmtCost(n) { return '₹' + Number(n).toLocaleString('en-IN', {maximumFractionDigits:0}); }
+function fmtDate(s) { return s ? s.split(' ')[0] : '—'; }
+
+// ── CLOCK ───────────────────────────────────────────────────────────────────
+setInterval(() => {
+  $('hdr-time').textContent = new Date().toLocaleTimeString('en-GB');
+}, 1000);
+
+// ── TABS ────────────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    $(`page-${tab.dataset.page}`).classList.add('active');
+    if (tab.dataset.page === 'records') loadRecords();
+    if (tab.dataset.page === 'dashboard') loadDashboard();
+    if (tab.dataset.page === 'admin') loadAdminRoads();
+  });
+});
+
+// ── MAPS ────────────────────────────────────────────────────────────────────
+const mapTile = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+const mapAttr = '&copy; OpenStreetMap &copy; CARTO';
+
+const map1 = L.map('map').setView([19.076, 72.877], 13);
+L.tileLayer(mapTile, { attribution: mapAttr }).addTo(map1);
+let markers1 = L.layerGroup().addTo(map1);
+
+const map2 = L.map('map2').setView([19.076, 72.877], 14);
+L.tileLayer(mapTile, { attribution: mapAttr }).addTo(map2);
+let markers2 = L.layerGroup().addTo(map2);
+let radiusCircle = null;
+
+// ── DASHBOARD ───────────────────────────────────────────────────────────────
+async function loadDashboard() {
+  try {
+    const [stats, roads, records] = await Promise.all([
+      fetch(`${API}/api/stats`).then(r=>r.json()),
+      fetch(`${API}/api/roads`).then(r=>r.json()),
+      fetch(`${API}/api/records?limit=500`).then(r=>r.json()),
+    ]);
+
+    $('s-total').textContent  = stats.total_potholes ?? '—';
+    $('s-zones').textContent  = stats.critical_zones ?? '—';
+    $('s-cost').textContent   = fmtCost(stats.total_cost ?? 0);
+    $('hdr-total').textContent = `${stats.total_potholes ?? 0} RECORDS`;
+
+    const sev = stats.severity_breakdown || {};
+    const total = stats.total_potholes || 1;
+    const severeCount = sev['Severe'] || 0;
+    $('s-severe').textContent = severeCount;
+
+    // Severity bars
+    const sevHtml = [
+      { name:'Severe',   count: sev['Severe']||0,   color:'var(--accent2)' },
+      { name:'Moderate', count: sev['Moderate']||0, color:'var(--accent)' },
+      { name:'Minor',    count: sev['Minor']||0,    color:'var(--muted)' },
+    ].map(s => `
+      <div class="sev-row">
+        <span class="sev-name">${s.name}</span>
+        <div class="sev-bar-outer"><div class="sev-bar-inner" style="width:${Math.round(s.count/total*100)}%;background:${s.color}"></div></div>
+        <span class="sev-count">${s.count}</span>
+      </div>
+    `).join('');
+    $('sev-chart').innerHTML = sevHtml;
+
+    // Top roads
+    const roadList = (roads.roads || []).slice(0, 8);
+    $('roads-list').innerHTML = roadList.length
+      ? roadList.map(r => `<div style="padding:6px 0;border-bottom:1px solid var(--border);color:var(--text)">${r}</div>`).join('')
+      : '<span>No road data yet.</span>';
+
+    // Map markers
+    markers1.clearLayers();
+    (records.records || []).forEach(p => {
+      const color = p.severity === 'Severe' ? '#e03c3c' : p.severity === 'Moderate' ? '#f5a623' : '#5a6478';
+      L.circleMarker([p.lat, p.lon], { radius:6, color, fillColor:color, fillOpacity:.8, weight:1 })
+        .bindPopup(`<b>${p.road_name}</b><br>${p.severity}<br>${fmtCost(p.cost)}`)
+        .addTo(markers1);
+    });
+    if (records.records?.length) {
+      const lats = records.records.map(p=>p.lat), lons = records.records.map(p=>p.lon);
+      map1.fitBounds([[Math.min(...lats), Math.min(...lons)],[Math.max(...lats), Math.max(...lons)]], {padding:[30,30]});
+    }
+  } catch(e) {
+    console.error('Dashboard load error:', e);
+  }
+}
+
+loadDashboard();
+
+// ── UPLOAD / ANALYZE ────────────────────────────────────────────────────────
+const videoInput = $('video-input');
+const uploadZone = $('upload-zone');
+let selectedFile = null;
+
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault(); uploadZone.classList.remove('drag');
+  selectedFile = e.dataTransfer.files[0];
+  $('file-name').textContent = selectedFile?.name || '';
+});
+videoInput.addEventListener('change', () => {
+  selectedFile = videoInput.files[0];
+  $('file-name').textContent = selectedFile?.name || '';
+});
+
+$('analyze-btn').addEventListener('click', async () => {
+  if (!selectedFile) { showAlert($('analyze-alert'), 'Please select a video file first.'); return; }
+  hideAlert($('analyze-alert'));
+
+  const btn = $('analyze-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ PROCESSING…';
+
+  const pw = $('progress-wrap');
+  const pb = $('progress-bar');
+  const pl = $('progress-label');
+  pw.classList.add('visible');
+  pb.style.width = '5%';
+  pl.textContent = 'Uploading video…';
+
+  const fd = new FormData();
+  fd.append('video',       selectedFile);
+  fd.append('start_lat',   $('start-lat').value);
+  fd.append('start_lon',   $('start-lon').value);
+  fd.append('end_lat',     $('end-lat').value);
+  fd.append('end_lon',     $('end-lon').value);
+  fd.append('confidence',  $('confidence').value);
+  fd.append('road_name',   $('road-name').value);
+  fd.append('horizon',     $('horizon-check').checked ? 'true' : 'false');
+
+  // Fake progress while server processes
+  let pct = 5;
+  const ticker = setInterval(() => {
+    pct = Math.min(pct + Math.random() * 4, 88);
+    pb.style.width = pct + '%';
+    pl.textContent = pct < 30 ? 'Uploading video…' : pct < 60 ? 'Running YOLO detection…' : 'Mapping detections…';
+  }, 800);
+
+  try {
+    const res = await fetch(`${API}/api/analyze`, { method:'POST', body: fd });
+    clearInterval(ticker);
+    pb.style.width = '100%';
+
+    if (!res.ok) {
+      const err = await res.json().catch(()=>({error:'Server error'}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    pl.textContent = `✓ Complete — ${data.total_detections} potholes detected`;
+
+    // Show results
+    $('result-placeholder').style.display = 'none';
+    $('result-content').style.display = 'block';
+
+    $('r-total').textContent = data.total_detections;
+    const severe = (data.records||[]).filter(r=>r.severity==='Severe').length;
+    $('r-severe').textContent = severe;
+    const totalCost = (data.records||[]).reduce((a,r)=>a+r.cost,0);
+    $('r-cost').textContent = fmtCost(totalCost);
+
+    // Video — rebuild the element to force browser to pick up new src
+    const vidContainer = $('result-video').parentElement;
+    const oldVid = $('result-video');
+    oldVid.remove();
+    const vid = document.createElement('video');
+    vid.id = 'result-video';
+    vid.controls = true;
+    vid.setAttribute('playsinline', '');
+    vid.setAttribute('preload', 'auto');
+    vid.style.cssText = 'width:100%;max-height:320px;background:#000;display:block;border:1px solid var(--border);';
+    const src = document.createElement('source');
+    src.src = `${API}${data.output_video_url}`;
+    src.type = data.output_mime || 'video/mp4';
+    vid.appendChild(src);
+    // Fallback source without explicit type
+    const src2 = document.createElement('source');
+    src2.src = `${API}${data.output_video_url}`;
+    vid.appendChild(src2);
+    vid.onerror = () => {
+      vidContainer.innerHTML += '<div style="font-family:var(--mono);font-size:11px;color:var(--accent2);margin-top:8px;">⚠ Video preview unavailable — browser codec issue. Detection data saved to database.</div>';
+    };
+    vidContainer.insertBefore(vid, vidContainer.firstChild);
+
+    // Table
+    $('result-table').innerHTML = (data.records||[]).slice(0,50).map(r=>`
+      <tr>
+        <td>${r.road_name}</td>
+        <td>${badgeHtml(r.severity)}</td>
+        <td>${r.lat.toFixed(5)}</td>
+        <td>${r.lon.toFixed(5)}</td>
+        <td>${fmtCost(r.cost)}</td>
+      </tr>
+    `).join('');
+
+    loadDashboard();
+    showAlert($('analyze-alert'), `Analysis complete! ${data.total_detections} potholes saved to database.`, 'success');
+  } catch(e) {
+    clearInterval(ticker);
+    showAlert($('analyze-alert'), `Error: ${e.message}`);
+    pw.classList.remove('visible');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '▶ START ANALYSIS';
+  }
+});
+
+// ── HAZARD SCANNER ──────────────────────────────────────────────────────────
+$('hz-scan-btn').addEventListener('click', async () => {
+  const lat = parseFloat($('hz-lat').value);
+  const lon = parseFloat($('hz-lon').value);
+  const r   = parseFloat($('hz-radius').value);
+
+  if (isNaN(lat)||isNaN(lon)) { showAlert($('hz-alert'),'Enter valid lat/lon.'); return; }
+  hideAlert($('hz-alert'));
+
+  try {
+    const data = await fetch(`${API}/api/hazards?lat=${lat}&lon=${lon}&radius_m=${r}`).then(d=>d.json());
+
+    // Map
+    markers2.clearLayers();
+    if (radiusCircle) { map2.removeLayer(radiusCircle); }
+    map2.setView([lat, lon], 15);
+
+    radiusCircle = L.circle([lat, lon], { radius: r, color:'#f5a623', fillOpacity:.06, weight:1 }).addTo(map2);
+    L.marker([lat, lon], { icon: L.divIcon({ className:'', html:'<div style="background:#3ce08a;width:12px;height:12px;border-radius:50%;border:2px solid #fff"></div>' }) })
+      .bindPopup('Your Location').addTo(markers2);
+
+    data.hazards.forEach(h => {
+      const color = h.severity==='Severe'?'#e03c3c':h.severity==='Moderate'?'#f5a623':'#5a6478';
+      L.circleMarker([h.lat,h.lon],{radius:7,color,fillColor:color,fillOpacity:.85,weight:1})
+        .bindPopup(`<b>${h.road_name}</b><br>${h.severity}`)
+        .addTo(markers2);
+    });
+
+    const countEl = $('hz-count');
+    if (data.count === 0) {
+      countEl.innerHTML = '<span style="color:var(--accent3)">✓ Road clear — no hazards within radius.</span>';
+    } else {
+      countEl.innerHTML = `<span style="color:var(--accent2)">⚠ ${data.count} pothole${data.count>1?'s':''} detected within ${r}m</span>`;
+    }
+
+    $('hz-table').innerHTML = data.hazards.map(h => {
+      const dist = Math.round(
+        Math.sqrt(Math.pow((h.lat-lat)*111000,2)+Math.pow((h.lon-lon)*111000*Math.cos(lat*Math.PI/180),2))
+      );
+      return `<tr><td>${h.road_name}</td><td>${badgeHtml(h.severity)}</td><td>${dist}m</td></tr>`;
+    }).join('');
+  } catch(e) {
+    showAlert($('hz-alert'), `Scan failed: ${e.message}`);
+  }
+});
+
+// ── RECORDS ─────────────────────────────────────────────────────────────────
+let allRecords = [];
+let currentPage = 1;
+const PAGE_SIZE = 50;
+
+async function loadRecords() {
+  try {
+    const data = await fetch(`${API}/api/records?limit=1000`).then(r=>r.json());
+    allRecords = data.records || [];
+    renderRecords();
+  } catch(e) { console.error(e); }
+}
+
+function renderRecords() {
+  const filter = $('records-filter').value.toLowerCase();
+  const filtered = filter ? allRecords.filter(r=>r.road_name.toLowerCase().includes(filter)) : allRecords;
+  const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  if (currentPage > pages) currentPage = 1;
+  const slice = filtered.slice((currentPage-1)*PAGE_SIZE, currentPage*PAGE_SIZE);
+
+  $('records-count').textContent = `${filtered.length} records`;
+  $('records-table').innerHTML = slice.map((r,i) => `
+    <tr>
+      <td>${(currentPage-1)*PAGE_SIZE+i+1}</td>
+      <td>${r.road_name}</td>
+      <td>${badgeHtml(r.severity)}</td>
+      <td>${r.lat?.toFixed(5)}</td>
+      <td>${r.lon?.toFixed(5)}</td>
+      <td>${fmtCost(r.cost)}</td>
+      <td>${fmtDate(r.created_at)}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="7" style="color:var(--muted);text-align:center;padding:30px">No records found.</td></tr>';
+
+  $('records-pagination').innerHTML = pages <= 1 ? '' : `
+    <button class="btn btn-ghost" onclick="changePage(-1)" ${currentPage===1?'disabled':''}>← PREV</button>
+    <span>Page ${currentPage} / ${pages}</span>
+    <button class="btn btn-ghost" onclick="changePage(1)" ${currentPage===pages?'disabled':''}>NEXT →</button>
+  `;
+}
+
+function changePage(d) { currentPage += d; renderRecords(); }
+
+$('records-filter').addEventListener('input', () => { currentPage=1; renderRecords(); });
+$('records-refresh').addEventListener('click', loadRecords);
+
+// ── ADMIN ────────────────────────────────────────────────────────────────────
+let adminKey = '';
+
+$('login-btn').addEventListener('click', async () => {
+  const pass = $('admin-pass').value;
+  if (!pass) { showAlert($('login-alert'),'Enter password.'); return; }
+
+  // Test key against /api/admin/reset with a dry-run approach: try /api/stats (open) first
+  // then validate by hitting a protected endpoint
+  try {
+    const res = await fetch(`${API}/api/admin/pricing`, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'X-Admin-Key': pass },
+      body: JSON.stringify({})
+    });
+    if (res.status === 403) { showAlert($('login-alert'),'Invalid password.'); return; }
+    adminKey = pass;
+    $('admin-login').style.display = 'none';
+    $('admin-panel').classList.add('visible');
+    loadAdminRoads();
+  } catch(e) { showAlert($('login-alert'), `Error: ${e.message}`); }
+});
+
+$('logout-btn').addEventListener('click', () => {
+  adminKey = '';
+  $('admin-login').style.display = 'block';
+  $('admin-panel').classList.remove('visible');
+  $('admin-pass').value = '';
+});
+
+async function loadAdminRoads() {
+  if (!adminKey) return;
+  try {
+    const data = await fetch(`${API}/api/roads`).then(r=>r.json());
+    const sel = $('d-road');
+    sel.innerHTML = '<option value="">-- select road --</option>';
+    (data.roads||[]).forEach(r => {
+      const opt = document.createElement('option');
+      opt.value = opt.textContent = r;
+      sel.appendChild(opt);
+    });
+  } catch(e) {}
+}
+
+$('save-pricing-btn').addEventListener('click', async () => {
+  try {
+    const res = await fetch(`${API}/api/admin/pricing`, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'X-Admin-Key': adminKey },
+      body: JSON.stringify({ minor: $('cost-minor').value, moderate: $('cost-moderate').value, severe: $('cost-severe').value })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error||'Failed');
+    showAlert($('pricing-alert'), 'Pricing updated successfully.', 'success');
+  } catch(e) { showAlert($('pricing-alert'), e.message); }
+});
+
+$('dispatch-btn').addEventListener('click', async () => {
+  const road = $('d-road').value;
+  const phone = $('d-phone').value;
+  if (!road||!phone) { showAlert($('dispatch-alert'),'Select a road and enter phone number.'); return; }
+  try {
+    const res = await fetch(`${API}/api/dispatch`, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'X-Admin-Key': adminKey },
+      body: JSON.stringify({ road_name:road, phone, contractor_name:$('d-name').value, corporation:$('d-corp').value })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error||'Failed');
+    showAlert($('dispatch-alert'), `Work order dispatched to ${$('d-name').value||phone}!`, 'success');
+  } catch(e) { showAlert($('dispatch-alert'), e.message); }
+});
+
+$('reset-btn').addEventListener('click', async () => {
+  if (!confirm('⚠️ This will permanently delete ALL pothole records. Are you sure?')) return;
+  try {
+    const res = await fetch(`${API}/api/admin/reset`, {
+      method:'POST',
+      headers:{ 'X-Admin-Key': adminKey }
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error||'Failed');
+    showAlert($('reset-alert'), 'All records deleted.', 'success');
+    loadDashboard();
+  } catch(e) { showAlert($('reset-alert'), e.message); }
+});
+
+// ── RECORDS TAB: HARD RESET ─────────────────────────────────────────────────
+$('records-reset-btn').addEventListener('click', () => {
+  $('records-reset-prompt').style.display = 'block';
+  $('records-reset-pass').focus();
+  hideAlert($('records-reset-alert'));
+});
+
+$('records-reset-cancel').addEventListener('click', () => {
+  $('records-reset-prompt').style.display = 'none';
+  $('records-reset-pass').value = '';
+  hideAlert($('records-reset-alert'));
+});
+
+$('records-reset-confirm').addEventListener('click', async () => {
+  const pass = $('records-reset-pass').value.trim();
+  if (!pass) {
+    showAlert($('records-reset-alert'), 'Enter your admin password to confirm.');
+    return;
+  }
+  const btn = $('records-reset-confirm');
+  btn.disabled = true;
+  btn.textContent = 'DELETING…';
+  try {
+    const res = await fetch(`${API}/api/admin/reset`, {
+      method: 'POST',
+      headers: { 'X-Admin-Key': pass }
+    });
+    const data = await res.json();
+    if (res.status === 403) {
+      showAlert($('records-reset-alert'), 'Wrong admin password.');
+      return;
+    }
+    if (!res.ok) throw new Error(data.error || 'Reset failed');
+    $('records-reset-prompt').style.display = 'none';
+    $('records-reset-pass').value = '';
+    showAlert($('records-reset-alert'), '✓ All pothole records deleted successfully.', 'success');
+    allRecords = [];
+    renderRecords();
+    loadDashboard();
+  } catch(e) {
+    showAlert($('records-reset-alert'), `Error: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'CONFIRM DELETE ALL';
+  }
+});
+</script>
+</body>
+</html>
