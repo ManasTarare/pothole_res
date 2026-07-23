@@ -145,12 +145,8 @@ SECRET_KEY=<random-long-string>
 
 ## 🔮 Future Improvements
 
-- Integration with live GPS hardware modules.
 - Support for multiple defect classes (cracks, manholes, speed bumps).
-- Mobile app for field reporters.
-- PostgreSQL backend for persistent cloud storage.
-- OAuth / SSO for admin authentication.
-
+- Mobile app for field reporters
 ---
 
 *Developed for the Smart City Initiative.* 🚦
